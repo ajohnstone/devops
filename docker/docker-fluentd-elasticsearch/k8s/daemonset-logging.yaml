@@ -1,0 +1,75 @@
+apiVersion: extensions/v1beta1
+kind: DaemonSet
+metadata:
+  name: fluentd-es-v1
+  namespace: kube-system
+  labels:
+    k8s-app: fluentd-log
+    version: v1
+spec:
+  template:
+    metadata:
+      labels:
+        k8s-app: fluentd-log
+        version: v1
+    spec:
+      containers:
+      - name: fluentd-elasticsearch
+        image: XXX.dkr.ecr.eu-west-1.amazonaws.com/photobox/fluentd-elasticsearch:1.22
+        imagePullPolicy: Always
+        env:
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          - name: CLUSTER_NAME
+            valueFrom:
+              configMapKeyRef:
+                name: cluster-data
+                key: cluster.name
+          - name: CLUSTER_HOSTNAME_SUFFIX
+            valueFrom:
+              configMapKeyRef:
+                name: cluster-data
+                key: cluster.hostname-suffix
+          - name: ES_HOST
+            value: es-$(CLUSTER_HOSTNAME_SUFFIX)
+        resources:
+          limits:
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 200Mi
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        - name: mntdockercontainers
+          mountPath: /mnt/ephemeral/docker/containers
+          readOnly: true
+        - mountPath: /etc/td-agent/include.d
+          name: td-agent-conf-d
+          readOnly: true
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: mntdockercontainers
+        hostPath:
+          path: /mnt/ephemeral/docker/containers
+      - name: td-agent-conf-d
+        configMap:
+          name: td-agent-conf-d
+          items:
+          - key: output-elasticsearch.conf
+            path: output-elasticsearch.conf

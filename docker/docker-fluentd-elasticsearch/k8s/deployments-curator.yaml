@@ -1,0 +1,42 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: "elastic-search-curator"
+spec:
+  replicas: 1
+  template:
+    metadata:
+      name: elastic-search-curator
+      labels:
+        k8s-app: elastic-search-curator
+        track: "stable"
+        tier: "app"
+        monitored: "true"
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: "elastic-search-curator"
+          image: "XXX.dkr.ecr.eu-west-1.amazonaws.com/photobox/curator:3.5.0_2"
+          command: ["/bin/sh", "-c", "set -x; while [ 1 ]; do /usr/bin/curator --host=${ES_HOST} --port=443 --use_ssl delete indices --older-than 7 --time-unit days --timestring '%Y.%m.%d'; sleep 18000; done;"]
+          imagePullPolicy: Always
+          env:
+            - name: ES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-data
+                  key: cluster.es-endpoint
+          volumeMounts:
+            - mountPath: /root/.curator/
+              name: elastic-search-curator-confd
+              readOnly: true
+      volumes:
+        - name: elastic-search-curator-confd
+          configMap:
+            name: elastic-search-curator-confd
+            items:
+               - key: create-location-index-curator.yml
+                 path: create-location-index-curator.yml
+               - key: curator.yml
+                 path: curator.yml
+               - key: delete-log-files-curator.yml
+                 path: delete-log-files-curator.yml
