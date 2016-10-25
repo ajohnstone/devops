@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+ROOT_PATH=$(dirname $(dirname $(realpath ${BASH_SOURCE[0]})));
+. ${ROOT_PATH}/lib/util.sh;
+. ${ROOT_PATH}/lib/aws/r53.sh;
+
+CURRENT_PATH=$(dirname $(realpath ${BASH_SOURCE[0]}));
+cd ${CURRENT_PATH};
+
+util::prerequisites::cluster;
+util::prerequisites::aws_profile;
+util::prerequisites::context;
+
+ES_LOG_NAME=${ES_LOG_NAME:-'logging'};
+
+set -x
+
+function kubernetes::logging::configure {
+
+    local domain=$(kubernetes::get_domain);
+    local ns=kube-system;
+    local logging_name='fluentd-elasticsearch-v1';
+    local es_endpoint=$(aws --profile=${AWS_PROFILE} --output=text es describe-elasticsearch-domain --domain-name=${ES_LOG_NAME} --query='DomainStatus.Endpoint');
+
+    # configuring td-agent
+    {
+        kubernetes::ctl::delete td-agent-conf-d configmap ${ns};
+        sed "s/%ES_HOST%/${es_endpoint}/g;s/%CLUSTER_ID%/${CLUSTER_ID}/g;s/%AWS_REGION%/${AWS_REGION}/g" ./conf.d/output-elasticsearch.conf > /tmp/output-elasticsearch.conf;
+        kubectl --context=${KUBECTL_CONTEXT} --namespace=${ns} create configmap td-agent-conf-d --from-file=/tmp/output-elasticsearch.conf;
+    };
+
+    # configuring cluster-data
+    {
+        kubernetes::ctl::delete cluster-data configmap ${ns};
+        kubectl --context=${KUBECTL_CONTEXT} --namespace=${ns} create configmap cluster-data \
+            --from-literal=cluster.name="${CLUSTER_ID}" \
+            --from-literal=cluster.name-agnostic="$(kubernetes::cluster::get_agnostic)" \
+            --from-literal=cluster.domain="$(kubernetes::get_domain)" \
+            --from-literal=cluster.hostname-suffix="$(kubernetes::get_cluster_hostname_suffix)" \
+            --from-literal=cluster.default-certificate="$(kubernetes::get_default_certificate)" \
+            --from-literal=cluster.aws-load-balancer-access-log-s3-bucket-name="$(kubernetes::get_default_elb_bucket_name)" \
+            --from-literal=cluster.es-endpoint="${es_endpoint}" | /bin/true;
+    };
+
+    # configure kubernetes daemonset
+    {
+        kubernetes::ctl::delete ${logging_name} ds ${ns};
+        kubectl --context=${KUBECTL_CONTEXT} --namespace=${ns} apply -f ./daemonset-logging.yaml;
+    };
+}
+
+function aws::logging::configure {
+    kubernetes::get_meta;
+    local policy=$(< ./iam-policy/account-${ACCOUNT_ID}-es.json);
+    util::get_region;
+
+    # Create elastic search cluster for logging
+    aws --profile=${AWS_PROFILE} es describe-elasticsearch-domain --domain-name=${ES_LOG_NAME};
+    if [[ $? -eq 0 ]]; then
+        aws --profile=${AWS_PROFILE} es update-elasticsearch-domain-config --domain-name=${ES_LOG_NAME} --access-policies="${policy}";
+    else
+        aws --profile=${AWS_PROFILE} es create-elasticsearch-domain --domain-name=${ES_LOG_NAME} --elasticsearch-version='2.3' --elasticsearch-cluster-config='{
+            "DedicatedMasterEnabled": false,
+            "InstanceCount": 2,
+            "ZoneAwarenessEnabled": false,
+            "InstanceType": "m3.large.elasticsearch"
+        }' \
+        --access-policies="${policy}" \
+        --ebs-options EBSEnabled=true,VolumeType=gp2,VolumeSize=512;
+        while [ 1 ]; do
+            aws --profile=${AWS_PROFILE} es describe-elasticsearch-domain --domain-name=${ES_LOG_NAME} && break || {
+                printf .;
+                sleep 10;
+            }
+        done
+    fi
+
+    aws --profile=${AWS_PROFILE} cloudwatch put-metric-alarm \
+        --alarm-name $(kubernetes::cluster::get_agnostic)-all-logging-elasticsearch \
+        --alarm-description "Alarm when free space is less than 20000MB" \
+        --metric-name FreeStorageSpace \
+        --namespace AWS/ES \
+        --statistic Minimum \
+        --period 60 \
+        --threshold 20000 \
+        --comparison-operator LessThanOrEqualToThreshold  \
+        --dimensions "Name=ClientId,Value=${ACCOUNT_ID}" "Name=DomainName,Value=${ES_LOG_NAME}" \
+        --evaluation-periods 1 \
+        --alarm-actions arn:aws:sns:${AWS_REGION}:${ACCOUNT_ID}:$(util::cluster_name) \
+        --unit Megabytes;
+
+    for metric_name in ClusterStatus.red ClusterStatus.yellow; do
+        label=$(echo $metric_name | awk -F'.' '{print $2}');
+        aws --profile=${AWS_PROFILE} cloudwatch put-metric-alarm \
+            --alarm-name $(kubernetes::cluster::get_agnostic)-status-${label}-logging-elasticsearch \
+            --alarm-description "Alarm when elastic search cluster status is failing ${metric_name}" \
+            --metric-name ${metric_name} \
+            --namespace AWS/ES \
+            --statistic Average \
+            --period 60 \
+            --threshold 1 \
+            --comparison-operator GreaterThanOrEqualToThreshold  \
+            --dimensions "Name=ClientId,Value=${ACCOUNT_ID}" "Name=DomainName,Value=${ES_LOG_NAME}" \
+            --evaluation-periods 1 \
+            --alarm-actions arn:aws:sns:${AWS_REGION}:${ACCOUNT_ID}:$(util::cluster_name) \
+            --unit Count;
+    done
+
+    es_endpoint=$(aws --output=text --profile=${AWS_PROFILE} es describe-elasticsearch-domain --domain-name=${ES_LOG_NAME} --query='DomainStatus.Endpoint');
+
+    local domain=$(kubernetes::get_domain);
+    aws::route53::cname "es-${CLUSTER_ID}.${domain}" "${es_endpoint}";
+    aws::route53::cname "es.${domain}" "${es_endpoint}";
+}
+
+function elastic-search::curator {
+
+    ns=kube-system;
+
+    (
+        cd ../../../docker/docker-curator;
+        make;
+        make release;
+    );
+
+    es_endpoint=$(aws --output=text --profile=${AWS_PROFILE} es describe-elasticsearch-domain --domain-name=${ES_LOG_NAME} --query='DomainStatus.Endpoint');
+    sed "s/%ES_HOST%/${es_endpoint}/g;" curator-conf.d/curator.yml > /tmp/curator-conf.d-curator.yml;
+    kubernetes::ctl::delete elastic-search-curator-confd configmap ${ns};
+    kubectl --context=${KUBECTL_CONTEXT} --namespace=${ns} create configmap elastic-search-curator-confd \
+        --from-file=curator-conf.d/create-location-index-curator.yml \
+        --from-file=curator.yml=/tmp/curator-conf.d-curator.yml \
+        --from-file=curator-conf.d/delete-log-files-curator.yml;
+
+    kubectl --context=${KUBECTL_CONTEXT} --namespace=${ns} apply -f ./deployments-curator.yaml;
+}
+
+aws::logging::configure;
+kubernetes::logging::configure;
+elastic-search::curator;
